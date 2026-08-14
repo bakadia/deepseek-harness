@@ -1,0 +1,51 @@
+/* Scrollbar-map rail: a thin fixed strip over the active conversation
+   column's right edge (the native scrollbar gutter) mapping every rendered
+   user-question turn to one horizontal bar. Fixed positioning escapes the
+   column's own scrollport, so the rail stays glued to the viewport edge while
+   the transcript scrolls under it, like an editor minimap gutter. */
+
+.rail {
+  position: fixed;
+  z-index: 3;
+  /* Transparent hit-safe shell: only the tick buttons and their tooltip
+     anchors take pointer events, so the strip never blocks the scrollbar. */
+  pointer-events: none;
+}
+
+.mark {
+  position: absolute;
+  top: 0;
+  /* Longer (easer to aim at) and thicker than the old 5×3 thin tick; the
+     visible bar is one half of the full click target, which also extends
+     past the right edge so the whole strip is easy to hit. */
+  right: 1px;
+  width: 15px;
+  height: 6px;
+  margin-top: -3px;
+  padding: 0;
+  border: none;
+  border-radius: 3px;
+  background: var(--dsw-alias-scrollbar-hover-l2);
+  cursor: pointer;
+  pointer-events: auto;
+  transition: width 120ms var(--ds-ease-out, ease), background-color 120ms var(--ds-ease-out, ease);
+}
+
+.mark::after {
+  /* Invisible extension past the rail's right edge so the clickable area is
+     wider than the visible bar without widening the painted strip. */
+  content: '';
+  position: absolute;
+  top: -4px;
+  right: -6px;
+  bottom: -4px;
+  width: 20px;
+}
+
+.mark:hover,
+.mark:focus-visible {
+  width: 18px;
+  right: 3px;
+  background: var(--dsw-alias-state-business-primary);
+  outline: none;
+}

@@ -12,16 +12,29 @@
 // ChatNodeSeat subscribes to one Node key, so Assistant deltas and Tool
 // lifecycle updates replace only their own row without remounting it.
 
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import type { ConversationTimelineSnapshot } from '@deepseek-ai/dsh-client-runtime/client'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import type { ConversationTimelineSnapshot, UserMessageNode } from '@deepseek-ai/dsh-client-runtime/client'
 import { IconChevronDownOutline14 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { ChatViewSlotProps } from '../contract/slots.ts'
 import { PendingSteeringBubble } from './MessageItem.tsx'
 import { ChatNodeSeat } from './ChatNodeSeat.tsx'
 import { formatRunDuration } from './message-chrome.ts'
+import { ScrollbarMap, type ScrollbarMapRail } from './ScrollbarMap.tsx'
 import css from './ChatView.module.css'
 
 const FOLLOW_THRESHOLD = 24
+
+/** Question text of one user message: join text blocks, collapse whitespace.
+ *  Empty when the message is non-text (e.g. image-only), so the map can fall
+ *  back to a locale label. */
+function questionLabel(content: UserMessageNode['content']): string {
+  const parts: string[] = []
+  for (const block of content) {
+    const candidate = block as { type?: string; text?: string }
+    if (candidate.type === 'text' && typeof candidate.text === 'string') parts.push(candidate.text)
+  }
+  return parts.join(' ').replace(/\s+/g, ' ').trim()
+}
 
 /** Active column host when present; otherwise the view-local scroller. */
 function scrollerOf(from: HTMLElement): HTMLElement {
@@ -191,6 +204,107 @@ export function ChatView({
   const lastSteeringId = pendingSteering[pendingSteering.length - 1]?.id ?? null
   const followSig = `${openState}:${firstSeq}:${lastKey}:${order.length}:${running ? 1 : 0}:${lastSteeringId ?? ''}`
 
+  // Scrollbar-map source: every rendered user-question turn (ordinary user
+  // and admitted steering), paired with its question text. Memoized over the
+  // ordered keys + node store so streaming (which mutates node data, not the
+  // store's Map shape) does not churn the rail's measure pass.
+  const userRows = useMemo(() => {
+    const marks: Array<{ key: string; label: string }> = []
+    for (const key of order) {
+      const node = nodeStore.get(key)
+      if (node === undefined || (node.kind !== 'user' && node.kind !== 'steering')) continue
+      const label = questionLabel((node.data as { content: UserMessageNode['content'] }).content)
+      marks.push({ key, label: label === '' ? t('chat.scrollbarMap.noText') : label })
+    }
+    return marks
+    // `order` and `nodeStore` identities already encapsulate every change that
+    // can alter the mark set; `t` is stable per view so it never forces work.
+  }, [order, nodeStore, t])
+
+  // Measured rail payload, recomputed when the transcript layout changes but
+  // NOT on user scrolls (marks map content offsets, which are scroll-invariant;
+  // the fixed rail already overlays the scrollport, so geometry is stable too).
+  const [rail, setRail] = useState<ScrollbarMapRail | null>(null)
+  const railMeasureRef = useRef<() => void>(() => {})
+
+  const measureRail = useCallback((): void => {
+    const local = listRef.current
+    /* v8 ignore next -- ref-null guard: measurement only fires while the list is mounted. */
+    if (local === null || userRows.length === 0) {
+      setRail(null)
+      return
+    }
+    const scroller = scrollerOf(local)
+    const rect = scroller.getBoundingClientRect()
+    const height = scroller.clientHeight || rect.height
+    const total = scroller.scrollHeight
+    /* v8 ignore next -- jsdom/layout guard: a zero-height scrollport maps nothing. */
+    if (height <= 0 || total <= 0) {
+      setRail(null)
+      return
+    }
+    const collected: Array<ScrollbarMapRail['marks'][number]> = []
+    for (const row of userRows) {
+      const element = anchorElement(local, row.key)
+      if (element === null) continue
+      const contentTop = element.getBoundingClientRect().top - rect.top + scroller.scrollTop
+      const fraction = Math.min(1, Math.max(0, contentTop / total))
+      collected.push({ ...row, topFraction: fraction })
+    }
+    setRail({ viewport: { top: rect.top, left: rect.right, height }, marks: collected })
+  }, [listRef, userRows])
+
+  railMeasureRef.current = measureRail
+
+  // Feed the rail: measure after the open/render lands, then re-measure on
+  // window size changes. Content-growth re-measure rides the shared
+  // ResizeObserver above (marks are content-referenced, so user scrolls
+  // deliberately do not re-measure — they only slide the same transcript past
+  // a rail whose viewport geometry is already fixed).
+  useEffect(() => {
+    if (openState !== 'open') {
+      setRail(null)
+      return
+    }
+    const local = listRef.current
+    /* v8 ignore next -- ref-null guard: measurement only fires while the list is mounted. */
+    if (local === null) return
+    const measureRef = railMeasureRef
+    const measure = (): void => { measureRef.current() }
+    measure()
+    window.addEventListener('resize', measure)
+    return () => { window.removeEventListener('resize', measure) }
+  }, [openState, measureRail])
+
+  // A later prepend shifts every row's content offset; re-measure after the
+  // anchored prepend lands so the map stays aligned with the new transcript.
+  useEffect(() => {
+    if (!loadingOlder) return
+    const local = listRef.current
+    /* v8 ignore next -- ref-null guard: paging only drives a mounted list. */
+    if (local === null) return
+    requestAnimationFrame(() => { railMeasureRef.current() })
+  }, [loadingOlder])
+
+  const jumpToRow = (key: string): void => {
+    const local = listRef.current
+    /* v8 ignore next -- ref-null guard: the rail only renders alongside the mounted list. */
+    if (local === null) return
+    const scroller = scrollerOf(local)
+    const row = anchorElement(local, key)
+    /* v8 ignore next -- the row it names comes from the same keys the rail just measured. */
+    if (row === null) return
+    const rect = scroller.getBoundingClientRect()
+    const top = row.getBoundingClientRect().top - rect.top + scroller.scrollTop
+    scroller.scrollTop = top
+    observedTopRef.current = top
+    atBottomRef.current = false
+    setAtBottom(false)
+    const position = scrollPosition(local, scroller)
+    if (position === null) chatScroll.save(null)
+    else chatScroll.save(position)
+  }
+
   const toBottom = (el: HTMLElement): void => {
     anchorRef.current = null
     el.scrollTop = el.scrollHeight
@@ -327,14 +441,18 @@ export function ChatView({
   }
   // Streaming, tool disclosures, and other flow changes resize the column;
   // the sticky composer resizes outside it. This observer owns ChatView's
-  // dynamic-height follow decisions and writes only while the reader is pinned.
+  // dynamic-height follow decisions (writes only while the reader is pinned)
+  // and re-measures the scrollbar-map rail on the same content growth.
   useEffect(() => {
     const column = columnRef.current
     const local = listRef.current
     if (column === null || local === null || typeof ResizeObserver === 'undefined') return
     const scrollport = scrollerOf(local)
     const composer = scrollport.querySelector<HTMLElement>('[data-composer-seat]')
-    const observer = new ResizeObserver(() => { followRef.current?.() })
+    const observer = new ResizeObserver(() => {
+      followRef.current?.()
+      railMeasureRef.current()
+    })
     observer.observe(column)
     if (composer !== null) observer.observe(composer)
     return () => { observer.disconnect() }
@@ -422,6 +540,7 @@ export function ChatView({
           </div>
         )}
       </div>
+      <ScrollbarMap rail={rail} onJump={jumpToRow} t={t} />
     </div>
   )
 }

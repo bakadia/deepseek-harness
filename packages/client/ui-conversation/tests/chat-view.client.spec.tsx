@@ -1355,3 +1355,66 @@ describe('ChatView', () => {
     expect(failedView.container.querySelector('[data-state="error"]')).not.toBeNull()
   })
 })
+
+describe('conversation scrollbar map', () => {
+  it('hides the rail until the transcript is measured', () => {
+    const h = makeHarness({ nodes: [user(1, 'first q'), assistant(2, 'a'), user(3, 'second q')] })
+    const view = render(<h.ChatView {...h.props} />)
+    // jsdom has no layout: metrics are zero, so the map stays off.
+    expect(view.container.querySelector('[class*="rail"]')).toBeNull()
+  })
+
+  it('maps user turns to rail marks and jumps the transcript on click', () => {
+    const h = makeHarness({
+      nodes: [user(1, 'first'), assistant(2, 'a'), user(3, 'second'), assistant(4, 'b')],
+    })
+    const view = render(<h.ChatView {...h.props} />)
+    const scroller = view.container.querySelector('[class*="scroll"]') as HTMLDivElement
+    Object.defineProperty(scroller, 'scrollHeight', { value: 1000, writable: true })
+    Object.defineProperty(scroller, 'clientHeight', { value: 400, writable: true })
+    const scrollerRect = { top: 10, bottom: 410, left: 5, right: 405 } as DOMRect
+    vi.spyOn(scroller, 'getBoundingClientRect').mockReturnValue(scrollerRect)
+    const first = view.container.querySelector('[data-chat-anchor-key="fixture:user:1"]') as HTMLDivElement
+    const second = view.container.querySelector('[data-chat-anchor-key="fixture:user:3"]') as HTMLDivElement
+    vi.spyOn(first, 'getBoundingClientRect').mockReturnValue({ top: 110, bottom: 150, left: 5, right: 400 } as DOMRect)
+    vi.spyOn(second, 'getBoundingClientRect').mockReturnValue({ top: 310, bottom: 350, left: 5, right: 400 } as DOMRect)
+    // Leave the pinned-to-bottom posture (a trailing assistant, not a user,
+    // so the re-measure render below cannot snap the reader back down).
+    readerScroll(scroller, 40)
+    scroller.scrollTop = 0
+    // Appending a row re-runs the rail measure under the stubbed geometry.
+    act(() => { h.set({ nodes: [user(1, 'first'), assistant(2, 'a'), user(3, 'second'), assistant(4, 'b'), assistant(5, 'more')] }) })
+
+    const nav = view.getByRole('navigation', { name: '对话内提问定位' })
+    expect(nav).toBeTruthy()
+    const bars = [...nav.querySelectorAll('button')]
+    expect(bars).toHaveLength(2)
+    // contentTop / scrollHeight: (110-10)=100/1000=0.1, (310-10)=300/1000=0.3.
+    expect(bars[0]!.style.top).toBe('10%')
+    expect(bars[1]!.style.top).toBe('30%')
+
+    fireEvent.click(view.getByLabelText('跳到该提问：second'))
+    // Row 3 content offset 300 → the transcript lands with that row at the top.
+    expect(scroller.scrollTop).toBe(300)
+    // A jump away from the floor stops bottom-follow.
+    expect(view.getByLabelText('回到底部')).toBeTruthy()
+  })
+
+  it('falls back to a locale label for a non-text user message', () => {
+    const imageOnly = { type: 'image' as const, attachment: { ...user(1, '').content[0] } }
+    const h = makeHarness({
+      nodes: [{ ...user(1, ''), content: [imageOnly as never] }, assistant(2, 'answer')],
+    })
+    const view = render(<h.ChatView {...h.props} />)
+    const scroller = view.container.querySelector('[class*="scroll"]') as HTMLDivElement
+    Object.defineProperty(scroller, 'scrollHeight', { value: 1000, writable: true })
+    Object.defineProperty(scroller, 'clientHeight', { value: 400, writable: true })
+    vi.spyOn(scroller, 'getBoundingClientRect').mockReturnValue({ top: 10, bottom: 410, left: 5, right: 405 } as DOMRect)
+    const row = view.container.querySelector('[data-chat-anchor-key="fixture:user:1"]') as HTMLDivElement
+    vi.spyOn(row, 'getBoundingClientRect').mockReturnValue({ top: 110, bottom: 150, left: 5, right: 400 } as DOMRect)
+    readerScroll(scroller, 40)
+    scroller.scrollTop = 0
+    act(() => { h.set({ nodes: [{ ...user(1, ''), content: [imageOnly as never] }, assistant(2, 'answer'), assistant(3, 'more')] }) })
+    expect(view.getByLabelText('跳到该提问：（图片消息）')).toBeTruthy()
+  })
+})
